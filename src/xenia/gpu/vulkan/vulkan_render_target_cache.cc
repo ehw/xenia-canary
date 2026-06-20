@@ -3705,6 +3705,44 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           switch (dest_color_format) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8:
             case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+              // An EDRAM ownership transfer from a 7e3 (HDR float) tile to an
+              // 8_8_8_8 (LDR unorm) tile must value-convert: 7e3 is a float
+              // encoding with no host-format equivalent (reconstructed to packed
+              // 7e3 bits only for the transfer), so reading those bits back as
+              // unorm bytes scrambles the channels into garbage that shows
+              // through translucent geometry blended over the reused tile.
+              // Unpack the 7e3 floats and saturate to [0, 1] instead. Mirrors
+              // the value-converted 8_8_8_8 <-> gamma handling and the D3D12
+              // backend's TransferConvert7e3To8888.
+              if (source_is_color &&
+                  (source_color_format ==
+                       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+                   source_color_format ==
+                       xenos::ColorRenderTargetFormat::
+                           k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+                id_vector_temp.clear();
+                for (uint32_t i = 0; i < 3; ++i) {
+                  id_vector_temp.push_back(builder.createTriBuiltinCall(
+                      type_float, ext_inst_glsl_std_450, GLSLstd450NClamp,
+                      SpirvShaderTranslator::Float7e3To32(builder, packed,
+                                                          10 * i, false,
+                                                          ext_inst_glsl_std_450),
+                      builder.makeFloatConstant(0.0f),
+                      builder.makeFloatConstant(1.0f)));
+                }
+                id_vector_temp.push_back(builder.createBinOp(
+                    spv::OpFMul, type_float,
+                    builder.createUnaryOp(
+                        spv::OpConvertUToF, type_float,
+                        builder.createTriOp(spv::OpBitFieldUExtract, type_uint,
+                                            packed, builder.makeUintConstant(30),
+                                            builder.makeUintConstant(2))),
+                    builder.makeFloatConstant(1.0f / 3.0f)));
+                builder.createStore(builder.createCompositeConstruct(
+                                        type_fragment_data, id_vector_temp),
+                                    output_fragment_data);
+                break;
+              }
               spv::Id component_width = builder.makeUintConstant(8);
               spv::Id unorm_scale = builder.makeFloatConstant(1.0f / 255.0f);
               id_vector_temp.clear();
@@ -3748,6 +3786,33 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
             case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
             case xenos::ColorRenderTargetFormat::
                 k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+              if (source_is_color &&
+                  source_color_format ==
+                      xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                // 8_8_8_8 (LDR unorm) source reused as 7e3: value-convert by
+                // unpacking the unorm bytes to [0, 1], rather than reading them
+                // through the 7e3 float decoder (garbage shows through
+                // translucent geometry blended over the reused tile). Reverse of
+                // the 7e3 -> 8_8_8_8 case above; matches the D3D12 backend's
+                // TransferConvert8888To7e3.
+                spv::Id component_width = builder.makeUintConstant(8);
+                spv::Id unorm_scale = builder.makeFloatConstant(1.0f / 255.0f);
+                id_vector_temp.clear();
+                for (uint32_t i = 0; i < 4; ++i) {
+                  id_vector_temp.push_back(builder.createBinOp(
+                      spv::OpFMul, type_float,
+                      builder.createUnaryOp(
+                          spv::OpConvertUToF, type_float,
+                          builder.createTriOp(
+                              spv::OpBitFieldUExtract, type_uint, packed,
+                              builder.makeUintConstant(8 * i), component_width)),
+                      unorm_scale));
+                }
+                builder.createStore(builder.createCompositeConstruct(
+                                        type_fragment_data, id_vector_temp),
+                                    output_fragment_data);
+                break;
+              }
               id_vector_temp.clear();
               // Color.
               spv::Id width_rgb = builder.makeUintConstant(10);

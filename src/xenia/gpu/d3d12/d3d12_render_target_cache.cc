@@ -2033,6 +2033,41 @@ void D3D12RenderTargetCache::CommitEdramBufferUAVWrites(
   PixelShaderInterlockFullEdramBarrierPlaced();
 }
 
+// EDRAM ownership transfer, 7e3 (k_2_10_10_10_FLOAT) source -> 8_8_8_8 dest:
+// value-convert rather than bit-reinterpret. 7e3 is an HDR float encoding with
+// no host-format equivalent (stored as R16G16B16A16_FLOAT and reconstructed to
+// packed 7e3 bits in r1.x only for the transfer); reading those float-encoded
+// bits back as 8_8_8_8 unorm bytes scrambles the channels into garbage that
+// shows through translucent geometry blended over the reused tile. Unpack the
+// 7e3 floats and saturate to [0, 1] (using r2 as scratch). This mirrors the
+// existing value-converted handling of the 8_8_8_8 <-> 8_8_8_8_GAMMA pair.
+static void TransferConvert7e3To8888(dxbc::Assembler& a) {
+  for (uint32_t i = 0; i < 3; ++i) {
+    DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::R(2, 1 << i), 1, 0, i * 10,
+                                       0, 0, 0, 1);
+  }
+  a.OpUBFE(dxbc::Dest::R(2, 0b1000), dxbc::Src::LU(2), dxbc::Src::LU(30),
+           dxbc::Src::R(1, dxbc::Src::kXXXX));
+  a.OpUToF(dxbc::Dest::R(2, 0b1000), dxbc::Src::R(2, dxbc::Src::kWWWW));
+  a.OpMul(dxbc::Dest::R(2, 0b1000), dxbc::Src::R(2, dxbc::Src::kWWWW),
+          dxbc::Src::LF(1.0f / 3.0f));
+  a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(2), true);
+}
+
+// The reverse of TransferConvert7e3To8888: an EDRAM ownership transfer from an
+// 8_8_8_8 (LDR unorm) tile to a 7e3 (k_2_10_10_10_FLOAT) tile must value-convert
+// too. Unpack the 8_8_8_8 bytes packed in r1.x to [0, 1] and store directly (the
+// 7e3 host, R16G16B16A16_FLOAT, holds the linear value), rather than reading
+// those unorm bytes back through the 7e3 float decoder, which scrambles the
+// channels into garbage that shows through translucent geometry blended over
+// the reused tile. Uses r2 as scratch.
+static void TransferConvert8888To7e3(dxbc::Assembler& a) {
+  a.OpUBFE(dxbc::Dest::R(2), dxbc::Src::LU(8), dxbc::Src::LU(0, 8, 16, 24),
+           dxbc::Src::R(1, dxbc::Src::kXXXX));
+  a.OpUToF(dxbc::Dest::R(2), dxbc::Src::R(2));
+  a.OpMul(dxbc::Dest::O(0), dxbc::Src::R(2), dxbc::Src::LF(1.0f / 255.0f));
+}
+
 ID3D12PipelineState* const*
 D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
   const TransferModeInfo& mode = kTransferModes[size_t(key.mode)];
@@ -3787,8 +3822,21 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
         // 32bpp color output. Any register can be used as temporary if needed -
         // this is the end of the shader.
         if (color_packed_in_r1x) {
+          // An EDRAM ownership transfer from a 7e3 (HDR float) tile to an
+          // 8_8_8_8 (LDR unorm) tile must value-convert, not bit-reinterpret the
+          // float-encoded bits as unorm bytes (see TransferConvert7e3To8888).
+          const bool source_is_7e3 =
+              source_is_color &&
+              (source_color_format ==
+                   xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+               source_color_format == xenos::ColorRenderTargetFormat::
+                                           k_2_10_10_10_FLOAT_AS_16_16_16_16);
           switch (dest_color_format) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
+              if (source_is_7e3) {
+                TransferConvert7e3To8888(a);
+                break;
+              }
               a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8),
                        dxbc::Src::LU(0, 8, 16, 24),
                        dxbc::Src::R(1, dxbc::Src::kXXXX));
@@ -3799,6 +3847,10 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
               // 8_8_8_8_GAMMA is represented by linear stored in
               // R16G16B16A16_UNORM.
+              if (source_is_7e3) {
+                TransferConvert7e3To8888(a);
+                break;
+              }
               a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8),
                        dxbc::Src::LU(0, 8, 16, 24),
                        dxbc::Src::R(1, dxbc::Src::kXXXX));
@@ -3829,6 +3881,12 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
             case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
             case xenos::ColorRenderTargetFormat::
                 k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+              if (source_is_color &&
+                  source_color_format ==
+                      xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                TransferConvert8888To7e3(a);
+                break;
+              }
               // Color using r1.yz as temporary.
               for (uint32_t i = 0; i < 3; ++i) {
                 DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::O(0, 1 << i),
